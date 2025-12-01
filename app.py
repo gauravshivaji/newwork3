@@ -556,7 +556,7 @@ def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataF
         else:
             feat[f"Dist_SMA_{s}"] = np.nan
 
-    # Returns
+    # Returns (candle-based: for daily = days, weekly = weeks, hourly = hours)
     feat["Ret_3"] = df["Close"].pct_change(3)
     feat["Ret_5"] = df["Close"].pct_change(5)
     feat["Ret_10"] = df["Close"].pct_change(10)
@@ -567,13 +567,17 @@ def build_ml_features(df: pd.DataFrame, timeframe: str, ticker: str) -> pd.DataF
 
     # Label with future returns
     if timeframe == "1d":
-        horizon = 10
-        thr_buy = 0.05
-        thr_sell = -0.05
+        horizon = 10     # 10 daily candles ≈ 2 weeks
+        thr_buy = 0.05   # +5%
+        thr_sell = -0.05 # -5%
     elif timeframe == "1wk":
-        horizon = 4
-        thr_buy = 0.08
-        thr_sell = -0.08
+        horizon = 4      # 4 weekly candles ≈ 1 month
+        thr_buy = 0.08   # +8%
+        thr_sell = -0.08 # -8%
+    elif timeframe == "1h":
+        horizon = 24     # 24 hourly candles ≈ 1 trading week (approx)
+        thr_buy = 0.02   # +2% intraday move
+        thr_sell = -0.02 # -2%
     else:
         horizon = 10
         thr_buy = 0.05
@@ -734,15 +738,26 @@ with tabs[2]:
 
 # -------------------- ML TAB --------------------
 with tabs[3]:
-    st.subheader("🤖 ML-Based Buy/Sell Recommendations (Daily & Weekly)")
+    st.subheader("🤖 ML-Based Buy/Sell Recommendations (Hourly, Daily & Weekly)")
     st.write("Model: RandomForestClassifier trained on RSI, SMA distances, returns, Elliott 0/5 flags.")
 
     if st.button("Run ML Analysis on All Tickers"):
+        all_hourly = []
         all_daily = []
         all_weekly = []
 
-        # Build daily & weekly ML datasets for all default tickers
+        # Build hourly, daily & weekly ML datasets for all default tickers
         for tk in default_tickers:
+            # HOURLY
+            df_h_all = load_data(tk, "60d", "1h")
+            if not df_h_all.empty:
+                df_h_all = add_indicators(df_h_all)
+                df_h_all = add_wave0(df_h_all, "1h")
+                df_h_all = add_wave5(df_h_all, "1h")
+                feat_h = build_ml_features(df_h_all, "1h", tk)
+                if not feat_h.empty:
+                    all_hourly.append(feat_h)
+
             # DAILY
             df_d_all = load_data(tk, "3y", "1d")
             if not df_d_all.empty:
@@ -763,7 +778,7 @@ with tabs[3]:
                 if not feat_w.empty:
                     all_weekly.append(feat_w)
 
-        if not all_daily and not all_weekly:
+        if not all_daily and not all_weekly and not all_hourly:
             st.error("No sufficient data to train ML models.")
         else:
             feature_cols = [
@@ -779,9 +794,34 @@ with tabs[3]:
                 "Wave5_Flag",
             ]
 
-            # DAILY MODEL
-            daily_model = None
+            hourly_signals = None
             daily_signals = None
+            weekly_signals = None
+
+            # HOURLY MODEL
+            if all_hourly:
+                df_hourly_all = pd.concat(all_hourly, ignore_index=True)
+                hourly_model, _ = train_ml_model(df_hourly_all, feature_cols)
+
+                rows_h = []
+                for tk in default_tickers:
+                    df_h_curr = load_data(tk, "60d", "1h")
+                    if df_h_curr.empty:
+                        continue
+                    df_h_curr = add_indicators(df_h_curr)
+                    df_h_curr = add_wave0(df_h_curr, "1h")
+                    df_h_curr = add_wave5(df_h_curr, "1h")
+                    proba_h = predict_for_latest(df_h_curr, hourly_model, feature_cols)
+                    if proba_h is None:
+                        continue
+                    rows_h.append({
+                        "Ticker": tk,
+                        "P_Buy_Hourly": proba_h[2],
+                        "P_Sell_Hourly": proba_h[0],
+                    })
+                hourly_signals = pd.DataFrame(rows_h)
+
+            # DAILY MODEL
             if all_daily:
                 df_daily_all = pd.concat(all_daily, ignore_index=True)
                 daily_model, _ = train_ml_model(df_daily_all, feature_cols)
@@ -806,8 +846,6 @@ with tabs[3]:
                 daily_signals = pd.DataFrame(rows)
 
             # WEEKLY MODEL
-            weekly_model = None
-            weekly_signals = None
             if all_weekly:
                 df_weekly_all = pd.concat(all_weekly, ignore_index=True)
                 weekly_model, _ = train_ml_model(df_weekly_all, feature_cols)
@@ -830,24 +868,36 @@ with tabs[3]:
                     })
                 weekly_signals = pd.DataFrame(rows_w)
 
-            # MERGE DAILY + WEEKLY
-            if daily_signals is not None and weekly_signals is not None:
-                merged = pd.merge(daily_signals, weekly_signals, on="Ticker", how="outer")
-            elif daily_signals is not None:
-                merged = daily_signals.copy()
-            else:
-                merged = weekly_signals.copy()
+            # MERGE HOURLY + DAILY + WEEKLY
+            merged = None
+            for sig in [hourly_signals, daily_signals, weekly_signals]:
+                if sig is None or sig.empty:
+                    continue
+                if merged is None:
+                    merged = sig.copy()
+                else:
+                    merged = pd.merge(merged, sig, on="Ticker", how="outer")
 
             if merged is not None and not merged.empty:
-                merged = merged.sort_values("P_Buy_Daily", ascending=False, na_position="last")
+                # choose a sort column: prefer daily, then weekly, then hourly
+                sort_col = None
+                for c in ["P_Buy_Daily", "P_Buy_Weekly", "P_Buy_Hourly"]:
+                    if c in merged.columns:
+                        sort_col = c
+                        break
+                if sort_col is not None:
+                    merged = merged.sort_values(sort_col, ascending=False, na_position="last")
+
                 st.subheader("📋 Buy/Sell Probabilities per Ticker")
-                st.dataframe(
-                    merged.style.format({
-                        "P_Buy_Daily": "{:.2%}",
-                        "P_Sell_Daily": "{:.2%}",
-                        "P_Buy_Weekly": "{:.2%}",
-                        "P_Sell_Weekly": "{:.2%}",
-                    })
-                )
+                fmt = {}
+                for col in [
+                    "P_Buy_Hourly", "P_Sell_Hourly",
+                    "P_Buy_Daily", "P_Sell_Daily",
+                    "P_Buy_Weekly", "P_Sell_Weekly",
+                ]:
+                    if col in merged.columns:
+                        fmt[col] = "{:.2%}"
+
+                st.dataframe(merged.style.format(fmt))
             else:
                 st.warning("Could not compute signals for any ticker.")
